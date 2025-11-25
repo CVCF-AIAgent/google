@@ -1,9 +1,79 @@
-from flask import Flask, request, jsonify, render_template_string
+import os
 import datetime
+
+from flask import Flask, request, jsonify, render_template_string
+
+# Google API 関連
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from google.auth.transport.requests import Request
 
 app = Flask(__name__)
 
-# シンプルなHTMLをPython側でそのまま返す（テンプレートファイル分けなくてOK仕様）
+# カレンダー読み取り専用スコープ
+SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+
+# ---- ここから認証系のヘルパー ----
+
+def prepare_credential_files_from_env():
+    """
+    Render 用：
+    環境変数 GOOGLE_CREDENTIALS_JSON / GOOGLE_TOKEN_JSON があれば
+    credentials.json / token.json としてファイルを書き出す。
+    （ローカルではなくてもOKなので、今は「あるなら使う」くらいのノリ）
+    """
+    creds_env = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if creds_env and not os.path.exists("credentials.json"):
+        with open("credentials.json", "w", encoding="utf-8") as f:
+            f.write(creds_env)
+
+    token_env = os.environ.get("GOOGLE_TOKEN_JSON")
+    if token_env and not os.path.exists("token.json"):
+        with open("token.json", "w", encoding="utf-8") as f:
+            f.write(token_env)
+
+
+def get_creds():
+    """
+    OAuth 認証情報(token.json)を取得。
+    ・token.json があればそれを使う
+    ・なければ credentials.json を使ってブラウザで認証
+    ・必要なら refresh_token で自動更新
+    """
+    prepare_credential_files_from_env()
+
+    creds = None
+    if os.path.exists("token.json"):
+        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+
+    # 有効な認証情報がない / 期限切れなどの場合
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            # 期限切れだが refresh_token がある → 自動更新
+            creds.refresh(Request())
+        else:
+            # 初回認証：ブラウザを開いて Google ログイン＆許可
+            if not os.path.exists("credentials.json"):
+                raise RuntimeError(
+                    "credentials.json が見つかりません。GCP からダウンロードして "
+                    "このファイルと同じフォルダに置いてください。"
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(
+                "credentials.json", SCOPES
+            )
+            creds = flow.run_local_server(port=0)
+
+        # 更新or取得した認証情報を token.json に保存
+        with open("token.json", "w", encoding="utf-8") as token:
+            token.write(creds.to_json())
+
+    return creds
+
+# ---- ここまで認証系 ----
+
+
+# HTML テンプレ（前と同じ）
 INDEX_HTML = """
 <!doctype html>
 <html lang="ja">
@@ -61,7 +131,7 @@ INDEX_HTML = """
 </head>
 <body>
   <h1>カレンダー → スプレッドシート連携テスト</h1>
-  <p>まずは実験として、「実行」ボタンを押したときにバックエンドのPython処理が走り、そのログをここに表示します。</p>
+  <p>今は実験として、「実行」ボタンを押したときに Google カレンダーから予定を取得し、その結果をログに表示します。</p>
 
   <div class="card">
     <button id="run-btn">実行する</button>
@@ -102,7 +172,6 @@ INDEX_HTML = """
       runBtn.disabled = true;
       statusEl.textContent = '実行中...';
 
-      // 初回の「まだ実行していません」を消す
       if (logEl.textContent.trim() === '(まだ実行していません)') {
         logEl.textContent = '';
       }
@@ -145,34 +214,65 @@ INDEX_HTML = """
 
 @app.route("/", methods=["GET"])
 def index():
-    # HTML をそのまま返すだけ
     return render_template_string(INDEX_HTML)
 
 
 @app.route("/run", methods=["POST"])
 def run_job():
     """
-    将来的にここに:
-      - Googleカレンダー取得
-      - スプレッドシート更新
-    を書いていく。
-    今はダミーでログだけ返す。
+    ボタン押下で呼ばれるエンドポイント。
+    ここで Google カレンダーから「今日〜明日」の予定を取得してログとして返す。
     """
+    logs = []
     now = datetime.datetime.now()
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    logs.append(f"ジョブ開始: {now_str}")
 
-    # ここに実際の処理を書いて、その途中経過をlogsに足していくイメージ
-    logs = [
-        f"ジョブ開始: {now_str}",
-        "ステップ1: GoogleカレンダーAPIの認証チェック（ダミー）",
-        "ステップ2: 今日〜明日のイベントを取得（ダミー）",
-        "ステップ3: スプレッドシート更新（ダミー）",
-        "ジョブ完了 ✅",
-    ]
+    try:
+        # 認証
+        logs.append("Google カレンダー認証を開始します...")
+        creds = get_creds()
+        logs.append("Google カレンダー認証 OK ✅")
+
+        service = build("calendar", "v3", credentials=creds)
+        logs.append("Calendar API クライアント生成 OK")
+
+        # 期間：今日 0:00 〜 明日 23:59
+        today_start = datetime.datetime(now.year, now.month, now.day, 0, 0)
+        tomorrow_end = today_start + datetime.timedelta(days=2, seconds=-1)
+
+        time_min = today_start.isoformat() + "Z"
+        time_max = tomorrow_end.isoformat() + "Z"
+
+        logs.append(f"期間: {time_min} ～ {time_max} の予定を取得します...")
+
+        events_result = service.events().list(
+            calendarId="primary",
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
+        ).execute()
+
+        events = events_result.get("items", [])
+
+        if not events:
+            logs.append("今日〜明日の予定はありません。")
+        else:
+            logs.append(f"今日〜明日の予定件数: {len(events)} 件")
+            for e in events:
+                start_raw = e["start"].get("dateTime", e["start"].get("date"))
+                summary = e.get("summary", "（タイトルなし）")
+                logs.append(f"- {start_raw} | {summary}")
+
+        logs.append("ジョブ完了 ✅")
+
+    except Exception as e:
+        logs.append(f"[エラー] {repr(e)}")
 
     return jsonify({"status": "ok", "logs": logs})
 
 
 if __name__ == "__main__":
-    # ローカル実行時用（RenderではProcfileでgunicornを使う）
+    # ローカル実行用
     app.run(host="0.0.0.0", port=5000, debug=True)
